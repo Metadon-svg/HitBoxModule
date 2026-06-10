@@ -16,7 +16,7 @@ using namespace std;
     uintptr_t LEFTLEG_2 = RIGHTLEG_1 + 0x20;
     uintptr_t RIGHTLEG_2 = LEFTLEG_2 + 0x20;
 #else
-    uintptr_t HEAD = 0xD31C88;
+    uintptr_t HEAD = 0xD31488;
     uintptr_t TORSO_1 = HEAD + 0x18;
     uintptr_t TORSO_2 = TORSO_1 + 0x18;
     uintptr_t MID = TORSO_2 + 0x18;
