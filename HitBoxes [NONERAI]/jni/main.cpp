@@ -1,8 +1,11 @@
+--- START OF FILE main.cpp ---
+
 #include <iostream>
 #include <unistd.h>
 #include <pthread.h>
 #include <cstring>
 #include <cstdlib>
+#include <dlfcn.h>       // Добавлено для работы с dlopen/dlsym
 #include <android/log.h> // Для логирования в Logcat
 
 using namespace std;
@@ -56,8 +59,8 @@ void applyHitboxScale(float MultiplyValue) {
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Hitbox multiplier set to: %f", MultiplyValue);
 }
 
-// Объявление функции хука (Substrate / Cydia API)
-extern "C" void MSHookFunction(void *symbol, void *replace, void **result);
+// Указатель на функцию хука (будет инициализирован динамически)
+void (*MSHookFunction)(void *symbol, void *replace, void **result) = nullptr;
 
 // Указатель на оригинальную функцию
 int (*ProcessCommand_original)(const char* cmdText) = nullptr;
@@ -70,7 +73,7 @@ int ProcessCommand_hook(const char* cmdText) {
         if (scale > 0.0f) {
             applyHitboxScale(scale);
         }
-        return 1; // Возвращаем 1, чтобы игра считала команду выполненной локально и не слала её на сервер
+        return 1; // Команда обработана локально, не отправляем её на сервер
     }
     return ProcessCommand_original(cmdText);
 }
@@ -82,11 +85,18 @@ void *main_thread(void *) {
     applyHitboxScale(3.0f);
 
 #if !defined(__aarch64__)
-    // Для ARM32 устанавливаем хук на обработчик команд
-    void* process_cmd_addr = (void*)getAbsoluteAddress(libName, ProcessCommandOffset);
-    if (process_cmd_addr) {
-        MSHookFunction(process_cmd_addr, (void*)&ProcessCommand_hook, (void**)&ProcessCommand_original);
-        __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Hook successfully applied to ProcessCommand at 0x39300c");
+    // Динамически разрешаем адрес MSHookFunction в адресном пространстве процесса
+    MSHookFunction = (void (*)(void*, void*, void**))dlsym(RTLD_DEFAULT, "MSHookFunction");
+
+    if (MSHookFunction) {
+        // Для ARM32 устанавливаем хук на обработчик команд
+        void* process_cmd_addr = (void*)getAbsoluteAddress(libName, ProcessCommandOffset);
+        if (process_cmd_addr) {
+            MSHookFunction(process_cmd_addr, (void*)&ProcessCommand_hook, (void**)&ProcessCommand_original);
+            __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "MSHookFunction successfully resolved and hook applied.");
+        }
+    } else {
+        __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "Failed to resolve MSHookFunction! Hook NOT applied.");
     }
 #endif
 
