@@ -1,0 +1,43 @@
+name: Build NDK Module
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+
+      - name: Prepare sources
+        run: |
+          if [ -d "Hitbox [NONERAI]" ]; then
+            mv "Hitbox [NONERAI]" Hitbox_NONERAI
+          elif [ -d "HitBoxes [NONERAI]" ]; then
+            mv "HitBoxes [NONERAI]" Hitbox_NONERAI
+          fi
+
+      - name: Build
+        run: |
+          cd Hitbox_NONERAI/jni
+          $ANDROID_NDK_HOME/ndk-build -j$(nproc)
+
+      - name: Upload SO files
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-so
+          path: |
+            Hitbox_NONERAI/libs/**/*.so
+            Hitbox_NONERAI/libs/*/*.so
