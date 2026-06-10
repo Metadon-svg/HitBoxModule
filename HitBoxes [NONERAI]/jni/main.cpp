@@ -1,5 +1,3 @@
---- START OF FILE main.cpp ---
-
 #include <iostream>
 #include <unistd.h>
 #include <pthread.h>
