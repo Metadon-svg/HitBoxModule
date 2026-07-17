@@ -49,37 +49,58 @@ static void PlayHitSound() {
     long nowMs = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
     if (nowMs - g_LastHitTime < HIT_SOUND_COOLDOWN_MS) return;
     g_LastHitTime = nowMs;
-    if (!InitJNI()) return;
+
+    if (!InitJNI()) {
+        LOGE("InitJNI failed");
+        return;
+    }
 
     JNIEnv* env = nullptr;
-    if (g_JavaVM->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) return;
+    if (g_JavaVM->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) {
+        LOGE("AttachCurrentThread failed");
+        return;
+    }
 
     do {
         jclass atCls = env->FindClass("android/app/ActivityThread");
-        if (!atCls) break;
+        if (!atCls) { LOGE("FindClass ActivityThread failed"); break; }
         jmethodID curAT = env->GetStaticMethodID(atCls, "currentActivityThread", "()Landroid/app/ActivityThread;");
-        if (!curAT) break;
+        if (!curAT) { LOGE("GetStaticMethodID currentActivityThread failed"); break; }
         jobject at = env->CallStaticObjectMethod(atCls, curAT);
-        if (!at) break;
+        if (!at) { LOGE("currentActivityThread returned null"); break; }
         jmethodID getApp = env->GetMethodID(atCls, "getApplication", "()Landroid/app/Application;");
-        if (!getApp) break;
+        if (!getApp) { LOGE("GetMethodID getApplication failed"); break; }
         jobject ctx = env->CallObjectMethod(at, getApp);
-        if (!ctx) break;
+        if (!ctx) { LOGE("getApplication returned null"); break; }
 
         jstring jpath = env->NewStringUTF(HIT_SOUND_PATH);
         jclass uriCls = env->FindClass("android/net/Uri");
+        if (!uriCls) { LOGE("FindClass Uri failed"); break; }
         jmethodID parse = env->GetStaticMethodID(uriCls, "parse", "(Ljava/lang/String;)Landroid/net/Uri;");
+        if (!parse) { LOGE("GetStaticMethodID parse failed"); break; }
         jobject uri = env->CallStaticObjectMethod(uriCls, parse, jpath);
+        if (!uri) { LOGE("Uri.parse returned null"); break; }
+
         jclass mpCls = env->FindClass("android/media/MediaPlayer");
+        if (!mpCls) { LOGE("FindClass MediaPlayer failed"); break; }
         jmethodID create = env->GetStaticMethodID(mpCls, "create", "(Landroid/content/Context;Landroid/net/Uri;)Landroid/media/MediaPlayer;");
+        if (!create) { LOGE("GetStaticMethodID MediaPlayer.create failed"); break; }
         jobject mp = env->CallStaticObjectMethod(mpCls, create, ctx, uri);
+
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            LOGE("JNI Exception during MediaPlayer.create");
+        }
 
         if (mp) {
             jmethodID start = env->GetMethodID(mpCls, "start", "()V");
-            env->CallVoidMethod(mp, start);
+            if (start) env->CallVoidMethod(mp, start);
             jmethodID release = env->GetMethodID(mpCls, "release", "()V");
-            env->CallVoidMethod(mp, release);
+            if (release) env->CallVoidMethod(mp, release);
             env->DeleteLocalRef(mp);
+            LOGI("Hit sound played");
+        } else {
+            LOGE("MediaPlayer.create returned null");
         }
 
         env->DeleteLocalRef(jpath);
@@ -123,6 +144,7 @@ static void InstallBulletHitHook() {
         LOGE("Failed to get base address of %s", libName);
         return;
     }
+    LOGI("Base address: 0x%llX", (unsigned long long)base);
 
     uintptr_t target = base + OFFSET_BULLET_HIT_FUNC;
     uint32_t* p = reinterpret_cast<uint32_t*>(target);
@@ -132,8 +154,11 @@ static void InstallBulletHitHook() {
     g_OrigInsn[2] = p[2];
     g_OrigInsn[3] = p[3];
 
+    LOGI("Original insn: %08X %08X %08X %08X",
+         g_OrigInsn[0], g_OrigInsn[1], g_OrigInsn[2], g_OrigInsn[3]);
+
     if (g_OrigInsn[0] != 0xD10283FF) {
-        LOGW("Unexpected first instruction at target: 0x%08X", g_OrigInsn[0]);
+        LOGW("Unexpected first instruction at target: 0x%08X (expected 0xD10283FF)", g_OrigInsn[0]);
     }
 
     size_t stubSize = 256;
@@ -150,29 +175,45 @@ static void InstallBulletHitHook() {
     uintptr_t fnAddr = reinterpret_cast<uintptr_t>(&OnBulletHitNative);
     int idx = 0;
 
+    auto emitAdrpAddBl = [&](uintptr_t insnAddr, uintptr_t targetAddr) {
+        s[idx++] = MakeAdrp(16, insnAddr, targetAddr);
+        s[idx++] = MakeAdd(16, 16, targetAddr & 0xFFF);
+        s[idx++] = 0xD63F0210; // bl x16  <-- ИСПРАВЛЕНО: было br x16
+    };
+
     auto emitAdrpAddBr = [&](uintptr_t insnAddr, uintptr_t targetAddr) {
         s[idx++] = MakeAdrp(16, insnAddr, targetAddr);
         s[idx++] = MakeAdd(16, 16, targetAddr & 0xFFF);
         s[idx++] = 0xD61F0210; // br x16
     };
 
+    // Сохраняем lr/fp
     s[idx++] = 0xA9BF7BFD; // stp x29, x30, [sp, #-16]!
+    // Аргументы: x0 = victim (x19), x1 = attacker (x22)
     s[idx++] = 0xAA1303E0; // mov x0, x19
     s[idx++] = 0xAA1603E1; // mov x1, x22
 
-    emitAdrpAddBr(stub + idx * 4, fnAddr);
+    // bl &OnBulletHitNative
+    emitAdrpAddBl(stub + idx * 4, fnAddr);
 
+    // Восстанавливаем lr/fp
     s[idx++] = 0xA8C17BFD; // ldp x29, x30, [sp], #16
 
+    // Оригинальные 4 инструкции
     s[idx++] = g_OrigInsn[0];
     s[idx++] = g_OrigInsn[1];
     s[idx++] = g_OrigInsn[2];
     s[idx++] = g_OrigInsn[3];
 
+    // Прыжок обратно в оригинал
     emitAdrpAddBr(stub + idx * 4, retAddr);
 
+    // Патчим оригинал
     uintptr_t page = target & ~0xFFFULL;
-    mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
+    if (mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        LOGE("mprotect failed");
+        return;
+    }
 
     p[0] = 0x58000050; // ldr x16, [pc, #8]
     p[1] = 0xD61F0210; // br x16
@@ -181,6 +222,8 @@ static void InstallBulletHitHook() {
 
     __builtin___clear_cache(reinterpret_cast<char*>(target),
                             reinterpret_cast<char*>(target) + 16);
+    __builtin___clear_cache(reinterpret_cast<char*>(g_Trampoline),
+                            reinterpret_cast<char*>(g_Trampoline) + stubSize);
 
     LOGI("Hook installed at 0x%llX -> trampoline 0x%llX",
          (unsigned long long)target, (unsigned long long)stub);
@@ -189,6 +232,7 @@ static void InstallBulletHitHook() {
 void* main_thread(void*) {
     do { sleep(1); } while (!isLibraryLoaded(libName));
     usleep(500 * 1000);
+    LOGI("Library loaded, installing hook...");
     InstallBulletHitHook();
     pthread_exit(nullptr);
     return nullptr;
