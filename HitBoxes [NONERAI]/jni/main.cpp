@@ -22,12 +22,13 @@ constexpr const char* HIT_SOUND_PATH = "/storage/emulated/0/Nonerai/hit.mp3";
 constexpr int HIT_SOUND_COOLDOWN_MS = 80;
 
 static JavaVM* g_JavaVM = nullptr;
-static void*   g_Trampoline = nullptr;
-static uint32_t g_OrigInsn[4];
 static bool    g_HitSoundEnabled = true;
 static long    g_LastHitTime = 0;
 static volatile bool g_HitDetected = false;
 
+// ============================================================
+// JNI
+// ============================================================
 static bool InitJNI() {
     if (g_JavaVM) return true;
     using JNI_GetCreatedJavaVMs_t = jint (*)(JavaVM**, jsize, jsize*);
@@ -110,6 +111,9 @@ static void PlayHitSound() {
     g_JavaVM->DetachCurrentThread();
 }
 
+// ============================================================
+// Эта функция вызывается из asm stub. Только ставит флаг!
+// ============================================================
 extern "C" __attribute__((noinline)) void OnBulletHitNative(uintptr_t victim, uintptr_t attacker) {
     if (!attacker) return;
     uintptr_t base = getAbsoluteAddress(libName, 0);
@@ -120,180 +124,152 @@ extern "C" __attribute__((noinline)) void OnBulletHitNative(uintptr_t victim, ui
     }
 }
 
-static uint32_t MakeAdrp(int rd, uintptr_t pc, uintptr_t target) {
-    uint32_t insn = 0x90000000 | (rd & 0x1F);
-    int64_t imm = ((target & ~0xFFFULL) - (pc & ~0xFFFULL)) >> 12;
-    uint32_t immlo = imm & 3;
-    uint32_t immhi = (imm >> 2) & 0x7FFFF;
-    insn |= (immlo << 29);
-    insn |= (immhi << 5);
-    return insn;
-}
-
-static uint32_t MakeAdd(int rd, int rn, int imm12) {
-    uint32_t insn = 0x91000000 | (rd & 0x1F) | ((rn & 0x1F) << 5);
-    insn |= (imm12 & 0xFFF) << 10;
-    return insn;
-}
-
-static uint32_t MakeSubSp(int imm) {
-    return 0xD1000000 | ((imm & 0xFFF) << 10) | (31 << 5) | 31;
-}
-
-static uint32_t MakeAddSp(int imm) {
-    return 0x91000000 | ((imm & 0xFFF) << 10) | (31 << 5) | 31;
-}
-
-static uint32_t MakeStp(int rt, int rt2, int rn, int imm) {
-    uint32_t insn = 0xA9000000 | (rt & 0x1F) | ((rn & 0x1F) << 5) | ((rt2 & 0x1F) << 10);
-    int imm7 = imm / 8;
-    insn |= (imm7 & 0x7F) << 15;
-    return insn;
-}
-
-static uint32_t MakeLdp(int rt, int rt2, int rn, int imm) {
-    uint32_t insn = 0xA9400000 | (rt & 0x1F) | ((rn & 0x1F) << 5) | ((rt2 & 0x1F) << 10);
-    int imm7 = imm / 8;
-    insn |= (imm7 & 0x7F) << 15;
-    return insn;
-}
-
-static uint32_t MakeStr(int rt, int rn, int imm) {
-    uint32_t insn = 0xF9000000 | (rt & 0x1F) | ((rn & 0x1F) << 5);
-    int imm12 = imm / 8;
-    insn |= (imm12 & 0xFFF) << 10;
-    return insn;
-}
-
-static uint32_t MakeLdr(int rt, int rn, int imm) {
-    uint32_t insn = 0xF9400000 | (rt & 0x1F) | ((rn & 0x1F) << 5);
-    int imm12 = imm / 8;
-    insn |= (imm12 & 0xFFF) << 10;
-    return insn;
-}
-
+// ============================================================
+// INLINE HOOK
+// ============================================================
 static void InstallBulletHitHook() {
     uintptr_t base = getAbsoluteAddress(libName, 0);
     if (!base) {
         LOGE("Failed to get base address of %s", libName);
         return;
     }
-    LOGI("Base address: 0x%llX", (unsigned long long)base);
+    LOGI("Base: 0x%llX", (unsigned long long)base);
 
     uintptr_t target = base + OFFSET_BULLET_HIT_FUNC;
-    uint32_t* p = reinterpret_cast<uint32_t*>(target);
+    uint32_t* orig = reinterpret_cast<uint32_t*>(target);
 
-    g_OrigInsn[0] = p[0];
-    g_OrigInsn[1] = p[1];
-    g_OrigInsn[2] = p[2];
-    g_OrigInsn[3] = p[3];
+    uint32_t orig0 = orig[0];
+    uint32_t orig1 = orig[1];
+    uint32_t orig2 = orig[2];
+    uint32_t orig3 = orig[3];
 
-    LOGI("Original insn: %08X %08X %08X %08X",
-         g_OrigInsn[0], g_OrigInsn[1], g_OrigInsn[2], g_OrigInsn[3]);
+    LOGI("Orig: %08X %08X %08X %08X", orig0, orig1, orig2, orig3);
 
-    if (g_OrigInsn[0] != 0xD10283FF) {
-        LOGW("Unexpected first instruction: 0x%08X (expected 0xD10283FF)", g_OrigInsn[0]);
+    if (orig0 != 0xD10283FF) {
+        LOGW("Unexpected insn: 0x%08X", orig0);
     }
 
     size_t stubSize = 512;
-    g_Trampoline = mmap(nullptr, stubSize, PROT_READ | PROT_WRITE | PROT_EXEC,
-                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (g_Trampoline == MAP_FAILED) {
+    void* stub = mmap(nullptr, stubSize, PROT_READ | PROT_WRITE | PROT_EXEC,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (stub == MAP_FAILED) {
         LOGE("mmap failed");
         return;
     }
 
-    uint32_t* s = reinterpret_cast<uint32_t*>(g_Trampoline);
-    uintptr_t stub = reinterpret_cast<uintptr_t>(g_Trampoline);
+    uint8_t* code = reinterpret_cast<uint8_t*>(stub);
+    size_t off = 0;
+
+    // --- helper: write uint32_t ---
+    auto W32 = [&](uint32_t v) {
+        memcpy(code + off, &v, 4);
+        off += 4;
+    };
+
+    // --- helper: write uint64_t ---
+    auto W64 = [&](uint64_t v) {
+        memcpy(code + off, &v, 8);
+        off += 8;
+    };
+
+    // Stub layout:
+    // 1. Save regs: stp x29,x30,[sp,#-16]!
+    // 2. Save x0-x7 (caller-saved + args) on stack
+    // 3. mov x0, x19; mov x1, x22
+    // 4. bl &OnBulletHitNative
+    // 5. Restore x0-x7
+    // 6. ldp x29,x30,[sp],#16
+    // 7. Original 4 instructions
+    // 8. br back
+
+    // 1. Save fp/lr
+    W32(0xA9BF7BFD); // stp x29, x30, [sp, #-16]!
+
+    // 2. Save x0-x7 (64 bytes) below fp/lr
+    W32(0xA90007E0); // stp x0, x1, [sp, #-64]!
+    W32(0xA9010FE2); // stp x2, x3, [sp, #0x10]
+    W32(0xA90217E4); // stp x4, x5, [sp, #0x20]
+    W32(0xA9031FE6); // stp x6, x7, [sp, #0x30]
+
+    // 3. Args for C++ func
+    W32(0xAA1303E0); // mov x0, x19
+    W32(0xAA1603E1); // mov x1, x22
+
+    // 4. bl &OnBulletHitNative
+    //    adrp x16, page(fn); add x16, x16, offset; blr x16
+    uintptr_t pc_after_adrp = reinterpret_cast<uintptr_t>(code + off + 8);
+    uintptr_t fn = reinterpret_cast<uintptr_t>(&OnBulletHitNative);
+
+    uint32_t adrp = 0x90000010; // adrp x16, ...
+    int64_t imm = ((fn & ~0xFFFULL) - (pc_after_adrp & ~0xFFFULL)) >> 12;
+    uint32_t immlo = imm & 3;
+    uint32_t immhi = (imm >> 2) & 0x7FFFF;
+    adrp |= (immlo << 29);
+    adrp |= (immhi << 5);
+    W32(adrp);
+
+    uint32_t addi = 0x91000210; // add x16, x16, #0
+    addi |= (fn & 0xFFF) << 10;
+    W32(addi);
+
+    W32(0xD63F0200); // blr x16
+
+    // 5. Restore x0-x7
+    W32(0xA9431FE6); // ldp x6, x7, [sp, #0x30]
+    W32(0xA94217E4); // ldp x4, x5, [sp, #0x20]
+    W32(0xA9410FE2); // ldp x2, x3, [sp, #0x10]
+    W32(0xA94007E0); // ldp x0, x1, [sp], #64
+
+    // 6. Restore fp/lr
+    W32(0xA8C17BFD); // ldp x29, x30, [sp], #16
+
+    // 7. Original 4 instructions
+    W32(orig0);
+    W32(orig1);
+    W32(orig2);
+    W32(orig3);
+
+    // 8. br back to original + 16
     uintptr_t retAddr = target + 16;
-    uintptr_t fnAddr = reinterpret_cast<uintptr_t>(&OnBulletHitNative);
-    int idx = 0;
+    pc_after_adrp = reinterpret_cast<uintptr_t>(code + off + 8);
 
-    auto emitAdrpAddBl = [&](uintptr_t insnAddr, uintptr_t targetAddr) {
-        s[idx++] = MakeAdrp(16, insnAddr, targetAddr);
-        s[idx++] = MakeAdd(16, 16, targetAddr & 0xFFF);
-        s[idx++] = 0xD63F0210; // bl x16
-    };
+    adrp = 0x90000010;
+    imm = ((retAddr & ~0xFFFULL) - (pc_after_adrp & ~0xFFFULL)) >> 12;
+    immlo = imm & 3;
+    immhi = (imm >> 2) & 0x7FFFF;
+    adrp |= (immlo << 29);
+    adrp |= (immhi << 5);
+    W32(adrp);
 
-    auto emitAdrpAddBr = [&](uintptr_t insnAddr, uintptr_t targetAddr) {
-        s[idx++] = MakeAdrp(16, insnAddr, targetAddr);
-        s[idx++] = MakeAdd(16, 16, targetAddr & 0xFFF);
-        s[idx++] = 0xD61F0210; // br x16
-    };
+    addi = 0x91000210;
+    addi |= (retAddr & 0xFFF) << 10;
+    W32(addi);
 
-    // Save all caller-saved registers (x0-x17, x29, x30) = 160 bytes
-    s[idx++] = MakeSubSp(160);
-    s[idx++] = MakeStp(0, 1, 31, 0);
-    s[idx++] = MakeStp(2, 3, 31, 16);
-    s[idx++] = MakeStp(4, 5, 31, 32);
-    s[idx++] = MakeStp(6, 7, 31, 48);
-    s[idx++] = MakeStp(8, 9, 31, 64);
-    s[idx++] = MakeStp(10, 11, 31, 80);
-    s[idx++] = MakeStp(12, 13, 31, 96);
-    s[idx++] = MakeStp(14, 15, 31, 112);
-    s[idx++] = MakeStp(16, 17, 31, 128);
-    s[idx++] = MakeStr(29, 31, 144);
-    s[idx++] = MakeStr(30, 31, 152);
+    W32(0xD61F0200); // br x16
 
-    // Arguments: x0 = victim (x19), x1 = attacker (x22)
-    s[idx++] = 0xAA1303E0; // mov x0, x19
-    s[idx++] = 0xAA1603E1; // mov x1, x22
-
-    // bl &OnBulletHitNative
-    emitAdrpAddBl(stub + idx * 4, fnAddr);
-
-    // Restore all registers
-    s[idx++] = MakeLdp(0, 1, 31, 0);
-    s[idx++] = MakeLdp(2, 3, 31, 16);
-    s[idx++] = MakeLdp(4, 5, 31, 32);
-    s[idx++] = MakeLdp(6, 7, 31, 48);
-    s[idx++] = MakeLdp(8, 9, 31, 64);
-    s[idx++] = MakeLdp(10, 11, 31, 80);
-    s[idx++] = MakeLdp(12, 13, 31, 96);
-    s[idx++] = MakeLdp(14, 15, 31, 112);
-    s[idx++] = MakeLdp(16, 17, 31, 128);
-    s[idx++] = MakeLdr(29, 31, 144);
-    s[idx++] = MakeLdr(30, 31, 152);
-    s[idx++] = MakeAddSp(160);
-
-    // Original 4 instructions
-    s[idx++] = g_OrigInsn[0];
-    s[idx++] = g_OrigInsn[1];
-    s[idx++] = g_OrigInsn[2];
-    s[idx++] = g_OrigInsn[3];
-
-    // Jump back to original
-    emitAdrpAddBr(stub + idx * 4, retAddr);
-
-    // Patch original function
+    // --- Patch original ---
     uintptr_t page = target & ~0xFFFULL;
-    if (mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        LOGE("mprotect failed");
-        return;
-    }
+    mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
 
-    p[0] = 0x58000050; // ldr x16, [pc, #8]
-    p[1] = 0xD61F0210; // br x16
-    p[2] = static_cast<uint32_t>(stub);
-    p[3] = static_cast<uint32_t>(stub >> 32);
+    orig[0] = 0x58000050; // ldr x16, [pc, #8]
+    orig[1] = 0xD61F0210; // br x16
+    orig[2] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(stub));
+    orig[3] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(stub) >> 32);
 
-    __builtin___clear_cache(reinterpret_cast<char*>(target),
-                            reinterpret_cast<char*>(target) + 16);
-    __builtin___clear_cache(reinterpret_cast<char*>(g_Trampoline),
-                            reinterpret_cast<char*>(g_Trampoline) + stubSize);
+    __builtin___clear_cache(reinterpret_cast<char*>(target), reinterpret_cast<char*>(target) + 16);
+    __builtin___clear_cache(reinterpret_cast<char*>(stub), reinterpret_cast<char*>(stub) + stubSize);
 
-    LOGI("Hook installed at 0x%llX -> trampoline 0x%llX",
-         (unsigned long long)target, (unsigned long long)stub);
+    LOGI("Hook OK: target=0x%llX stub=0x%llX", (unsigned long long)target, (unsigned long long)stub);
 }
 
 void* main_thread(void*) {
     do { sleep(1); } while (!isLibraryLoaded(libName));
     usleep(500 * 1000);
-    LOGI("Library loaded, installing hook...");
+    LOGI("Installing hook...");
     InstallBulletHitHook();
 
     while (true) {
-        usleep(16 * 1000); // ~60 fps check
+        usleep(16 * 1000);
         if (g_HitDetected) {
             g_HitDetected = false;
             PlayHitSound();
