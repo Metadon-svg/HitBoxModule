@@ -21,4 +21,6 @@ LOCAL_C_INCLUDES += $(wildcard $(LOCAL_PATH)/)
 LOCAL_C_INCLUDES += $(wildcard $(LOCAL_PATH)/KittyMemory/)
 LOCAL_SRC_FILES := $(FILE_LIST:$(LOCAL_PATH)/%=%)
 
+LOCAL_LDLIBS += -llog -ldl
+
 include $(BUILD_SHARED_LIBRARY)
