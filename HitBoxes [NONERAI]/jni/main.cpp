@@ -26,6 +26,7 @@ static void*   g_Trampoline = nullptr;
 static uint32_t g_OrigInsn[4];
 static bool    g_HitSoundEnabled = true;
 static long    g_LastHitTime = 0;
+static volatile bool g_HitDetected = false;
 
 static bool InitJNI() {
     if (g_JavaVM) return true;
@@ -50,10 +51,7 @@ static void PlayHitSound() {
     if (nowMs - g_LastHitTime < HIT_SOUND_COOLDOWN_MS) return;
     g_LastHitTime = nowMs;
 
-    if (!InitJNI()) {
-        LOGE("InitJNI failed");
-        return;
-    }
+    if (!InitJNI()) { LOGE("InitJNI failed"); return; }
 
     JNIEnv* env = nullptr;
     if (g_JavaVM->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) {
@@ -112,13 +110,13 @@ static void PlayHitSound() {
     g_JavaVM->DetachCurrentThread();
 }
 
-extern "C" void OnBulletHitNative(uintptr_t victim, uintptr_t attacker) {
+extern "C" __attribute__((noinline)) void OnBulletHitNative(uintptr_t victim, uintptr_t attacker) {
     if (!attacker) return;
     uintptr_t base = getAbsoluteAddress(libName, 0);
     if (!base) return;
     uintptr_t localPlayer = *reinterpret_cast<uintptr_t*>(base + OFFSET_LOCAL_PLAYER_PTR);
     if (localPlayer && attacker == localPlayer) {
-        PlayHitSound();
+        g_HitDetected = true;
     }
 }
 
@@ -134,6 +132,42 @@ static uint32_t MakeAdrp(int rd, uintptr_t pc, uintptr_t target) {
 
 static uint32_t MakeAdd(int rd, int rn, int imm12) {
     uint32_t insn = 0x91000000 | (rd & 0x1F) | ((rn & 0x1F) << 5);
+    insn |= (imm12 & 0xFFF) << 10;
+    return insn;
+}
+
+static uint32_t MakeSubSp(int imm) {
+    return 0xD1000000 | ((imm & 0xFFF) << 10) | (31 << 5) | 31;
+}
+
+static uint32_t MakeAddSp(int imm) {
+    return 0x91000000 | ((imm & 0xFFF) << 10) | (31 << 5) | 31;
+}
+
+static uint32_t MakeStp(int rt, int rt2, int rn, int imm) {
+    uint32_t insn = 0xA9000000 | (rt & 0x1F) | ((rn & 0x1F) << 5) | ((rt2 & 0x1F) << 10);
+    int imm7 = imm / 8;
+    insn |= (imm7 & 0x7F) << 15;
+    return insn;
+}
+
+static uint32_t MakeLdp(int rt, int rt2, int rn, int imm) {
+    uint32_t insn = 0xA9400000 | (rt & 0x1F) | ((rn & 0x1F) << 5) | ((rt2 & 0x1F) << 10);
+    int imm7 = imm / 8;
+    insn |= (imm7 & 0x7F) << 15;
+    return insn;
+}
+
+static uint32_t MakeStr(int rt, int rn, int imm) {
+    uint32_t insn = 0xF9000000 | (rt & 0x1F) | ((rn & 0x1F) << 5);
+    int imm12 = imm / 8;
+    insn |= (imm12 & 0xFFF) << 10;
+    return insn;
+}
+
+static uint32_t MakeLdr(int rt, int rn, int imm) {
+    uint32_t insn = 0xF9400000 | (rt & 0x1F) | ((rn & 0x1F) << 5);
+    int imm12 = imm / 8;
     insn |= (imm12 & 0xFFF) << 10;
     return insn;
 }
@@ -158,10 +192,10 @@ static void InstallBulletHitHook() {
          g_OrigInsn[0], g_OrigInsn[1], g_OrigInsn[2], g_OrigInsn[3]);
 
     if (g_OrigInsn[0] != 0xD10283FF) {
-        LOGW("Unexpected first instruction at target: 0x%08X (expected 0xD10283FF)", g_OrigInsn[0]);
+        LOGW("Unexpected first instruction: 0x%08X (expected 0xD10283FF)", g_OrigInsn[0]);
     }
 
-    size_t stubSize = 256;
+    size_t stubSize = 512;
     g_Trampoline = mmap(nullptr, stubSize, PROT_READ | PROT_WRITE | PROT_EXEC,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (g_Trampoline == MAP_FAILED) {
@@ -178,7 +212,7 @@ static void InstallBulletHitHook() {
     auto emitAdrpAddBl = [&](uintptr_t insnAddr, uintptr_t targetAddr) {
         s[idx++] = MakeAdrp(16, insnAddr, targetAddr);
         s[idx++] = MakeAdd(16, 16, targetAddr & 0xFFF);
-        s[idx++] = 0xD63F0210; // bl x16  <-- ИСПРАВЛЕНО: было br x16
+        s[idx++] = 0xD63F0210; // bl x16
     };
 
     auto emitAdrpAddBr = [&](uintptr_t insnAddr, uintptr_t targetAddr) {
@@ -187,28 +221,51 @@ static void InstallBulletHitHook() {
         s[idx++] = 0xD61F0210; // br x16
     };
 
-    // Сохраняем lr/fp
-    s[idx++] = 0xA9BF7BFD; // stp x29, x30, [sp, #-16]!
-    // Аргументы: x0 = victim (x19), x1 = attacker (x22)
+    // Save all caller-saved registers (x0-x17, x29, x30) = 160 bytes
+    s[idx++] = MakeSubSp(160);
+    s[idx++] = MakeStp(0, 1, 31, 0);
+    s[idx++] = MakeStp(2, 3, 31, 16);
+    s[idx++] = MakeStp(4, 5, 31, 32);
+    s[idx++] = MakeStp(6, 7, 31, 48);
+    s[idx++] = MakeStp(8, 9, 31, 64);
+    s[idx++] = MakeStp(10, 11, 31, 80);
+    s[idx++] = MakeStp(12, 13, 31, 96);
+    s[idx++] = MakeStp(14, 15, 31, 112);
+    s[idx++] = MakeStp(16, 17, 31, 128);
+    s[idx++] = MakeStr(29, 31, 144);
+    s[idx++] = MakeStr(30, 31, 152);
+
+    // Arguments: x0 = victim (x19), x1 = attacker (x22)
     s[idx++] = 0xAA1303E0; // mov x0, x19
     s[idx++] = 0xAA1603E1; // mov x1, x22
 
     // bl &OnBulletHitNative
     emitAdrpAddBl(stub + idx * 4, fnAddr);
 
-    // Восстанавливаем lr/fp
-    s[idx++] = 0xA8C17BFD; // ldp x29, x30, [sp], #16
+    // Restore all registers
+    s[idx++] = MakeLdp(0, 1, 31, 0);
+    s[idx++] = MakeLdp(2, 3, 31, 16);
+    s[idx++] = MakeLdp(4, 5, 31, 32);
+    s[idx++] = MakeLdp(6, 7, 31, 48);
+    s[idx++] = MakeLdp(8, 9, 31, 64);
+    s[idx++] = MakeLdp(10, 11, 31, 80);
+    s[idx++] = MakeLdp(12, 13, 31, 96);
+    s[idx++] = MakeLdp(14, 15, 31, 112);
+    s[idx++] = MakeLdp(16, 17, 31, 128);
+    s[idx++] = MakeLdr(29, 31, 144);
+    s[idx++] = MakeLdr(30, 31, 152);
+    s[idx++] = MakeAddSp(160);
 
-    // Оригинальные 4 инструкции
+    // Original 4 instructions
     s[idx++] = g_OrigInsn[0];
     s[idx++] = g_OrigInsn[1];
     s[idx++] = g_OrigInsn[2];
     s[idx++] = g_OrigInsn[3];
 
-    // Прыжок обратно в оригинал
+    // Jump back to original
     emitAdrpAddBr(stub + idx * 4, retAddr);
 
-    // Патчим оригинал
+    // Patch original function
     uintptr_t page = target & ~0xFFFULL;
     if (mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
         LOGE("mprotect failed");
@@ -234,6 +291,15 @@ void* main_thread(void*) {
     usleep(500 * 1000);
     LOGI("Library loaded, installing hook...");
     InstallBulletHitHook();
+
+    while (true) {
+        usleep(16 * 1000); // ~60 fps check
+        if (g_HitDetected) {
+            g_HitDetected = false;
+            PlayHitSound();
+        }
+    }
+
     pthread_exit(nullptr);
     return nullptr;
 }
